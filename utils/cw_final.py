@@ -9,12 +9,16 @@ Referential implementation:
 import operator as op
 
 from typing import Union, Tuple
-
+from numba import jit
 import numpy as np
 import torch
+import time
 import torch.nn as nn
 import torch.optim as optim
 from torch.autograd import Variable
+from skimage import feature
+from skimage import color
+from skimage import io
 
 import utils.runutils as runutils
 
@@ -219,7 +223,7 @@ class L2Adversary(object):
         # `scale_const` won't ruin the optimum ever found.
         self.repeat = (self.binary_search_steps >= 10)
 
-    def __call__(self, model, inputs, targets, to_numpy=True):
+    def __call__(self, model, detectors, inputs, targets, to_numpy=True):
         """
         Produce adversarial examples for ``inputs``.
 
@@ -242,7 +246,9 @@ class L2Adversary(object):
         :type to_numpy: bool
         :return: the adversarial examples on CPU, of dimension [B x C x H x W]
         """
-        # sanity check
+        device = torch.device("cuda")
+
+	# sanity check
         assert isinstance(model, nn.Module)
         assert len(inputs.size()) == 4
         assert len(targets.size()) == 1
@@ -284,7 +290,7 @@ class L2Adversary(object):
         inputs_tanh_var = Variable(inputs_tanh, requires_grad=False)
 
         # the one-hot encoding of `targets`
-        targets_oh = torch.zeros(targets.size() + (num_classes,))  # type: torch.FloatTensor
+        targets_oh = torch.zeros(targets.size() + (num_classes,)).to(device)  # type: torch.FloatTensor
         targets_oh = runutils.make_cuda_consistent(model, targets_oh)[0]
         targets_oh.scatter_(1, targets.unsqueeze(1), 1.0)
         targets_oh_var = Variable(targets_oh, requires_grad=False)
@@ -292,7 +298,7 @@ class L2Adversary(object):
         # the perturbation variable to optimize.
         # `pert_tanh` is essentially the adversarial perturbation in tanh-space.
         # In Carlini's code it's denoted as `modifier`
-        pert_tanh = torch.zeros(inputs.size())  # type: torch.FloatTensor
+        pert_tanh = torch.zeros(inputs.size()).to(device)  # type: torch.FloatTensor
         if self.init_rand:
             nn.init.normal(pert_tanh, mean=0, std=1e-3)
         pert_tanh = runutils.make_cuda_consistent(model, pert_tanh)[0]
@@ -302,7 +308,7 @@ class L2Adversary(object):
         for sstep in range(self.binary_search_steps):
             if self.repeat and sstep == self.binary_search_steps - 1:
                 scale_consts_np = upper_bounds_np
-            scale_consts = torch.from_numpy(np.copy(scale_consts_np)).float()  # type: torch.FloatTensor
+            scale_consts = torch.from_numpy(np.copy(scale_consts_np)).float().to(device)  # type: torch.FloatTensor
             scale_consts = runutils.make_cuda_consistent(model, scale_consts)[0]
             scale_consts_var = Variable(scale_consts, requires_grad=False)
             #print('Using scale consts:', list(scale_consts_np))  # FIXME
@@ -315,11 +321,18 @@ class L2Adversary(object):
             # previous (summed) batch loss, to be used in early stopping policy
             prev_batch_loss = np.inf  # type: float
             for optim_step in range(self.max_steps):
-                batch_loss, pert_norms_np, pert_outputs_np, advxs_np = \
-                    self._optimize(model, optimizer, inputs_tanh_var,
+                #start = torch.cuda.Event(enable_timing=True)
+                #end = torch.cuda.Event(enable_timing=True)
+                
+                #start.record()
+                batch_loss, pert_norms_np, pert_outputs_np, advxs_np, out_detector = \
+                    self._optimize(model, detectors, optimizer, inputs_tanh_var,
                                    pert_tanh_var, targets_oh_var,
                                    scale_consts_var)
                 #if optim_step % 10 == 0: print('batch [{}] loss: {}'.format(optim_step, batch_loss))  # FIXME
+                #end.record()
+                #torch.cuda.synchronize()
+                #print(start.elapsed_time(end))
 
                 if self.abort_early and not optim_step % (self.max_steps // 10):
                     if batch_loss > prev_batch_loss * (1 - self.ae_tol):
@@ -338,15 +351,22 @@ class L2Adversary(object):
                     ppred = pert_predictions_np[i]
                     tlabel = targets_np[i]
                     ax = advxs_np[i]
-                    if self._attack_successful(cppred, tlabel):
+                    o_detect = out_detector[i]
+                    if self._attack_successful(cppred, tlabel, o_detect):
+                        #print("Attack Success")
+                        
                         assert cppred == ppred
                         if l2 < best_l2[i]:
                             best_l2[i] = l2
                             best_l2_ppred[i] = ppred
                         if l2 < o_best_l2[i]:
+                            #print(l2)
                             o_best_l2[i] = l2
                             o_best_l2_ppred[i] = ppred
-                            o_best_advx[i] = ax
+                            o_best_advx[i] = ax.cpu().numpy()
+                            #print(out_detector)
+                            #print(detector(torch.Tensor(feature.canny(ax.reshape(28, 28).numpy(), 
+                             #                      sigma=1.8).astype(float)).reshape(1,784)))
 
             # binary search of `scale_const`
             for i in range(batch_size):
@@ -377,9 +397,13 @@ class L2Adversary(object):
 
         if not to_numpy:
             o_best_advx = torch.from_numpy(o_best_advx).float()
+        #if o_best_l2 == np.inf:
+         #   print("Attack Failed!")
+        #else:
+            #print("before ", detector(torch.Tensor(o_best_advx).reshape(1, 784)))
         return o_best_advx, o_best_l2
 
-    def _optimize(self, model, optimizer, inputs_tanh_var, pert_tanh_var,
+    def _optimize(self, model, detectors, optimizer, inputs_tanh_var, pert_tanh_var,
                   targets_oh_var, c_var):
         """
         Optimize for one step.
@@ -403,9 +427,28 @@ class L2Adversary(object):
                  (of dimension [B]), the perturbed activations (of dimension
                  [B]), the adversarial examples (of dimension [B x C x H x W])
         """
+        batch_size = inputs_tanh_var.size(0)
+        device = torch.device("cuda")
+
         # the adversarial examples in the image space
         # of dimension [B x C x H x W]
-        advxs_var = self._from_tanh_space(inputs_tanh_var + pert_tanh_var)  # type: Variable
+        advxs_var = self._from_tanh_space(inputs_tanh_var + pert_tanh_var)  # type: Variable  
+        
+        #start = time.time()
+        # input to detector
+        if inputs_tanh_var.size(1) == 3:
+            inp_detector = torch.zeros((batch_size, 1024)).to(device)
+            for i in range(batch_size):
+                img = color.rgb2gray(data[i].permute(1,2,0).numpy())
+                inp_detector[i] = torch.Tensor(feature.canny(adv_im, 
+                                                       sigma=1.8).astype(float)).reshape(1024)
+        else:    
+            inp_detector = torch.zeros((batch_size, 784)).to(device)
+            for i in range(batch_size):
+                inp_detector[i] = torch.Tensor(feature.canny(advxs_var[i].reshape(28, 28).detach().cpu().numpy(), 
+                                                       sigma=1.8).astype(float)).reshape(784).to(device)
+        #end = time.time()
+        #print(end-start)
         # the perturbed activation before softmax
         pert_outputs_var = model(advxs_var)  # type: Variable
         # the original inputs
@@ -440,7 +483,9 @@ class L2Adversary(object):
         # noinspection PyArgumentList
         maxother_activ_var = torch.max(((1 - targets_oh_var) * pert_outputs_var
                                         - targets_oh_var * inf), 1)[0]
-
+        maxother_activ_ind = torch.argmax(((1 - targets_oh_var) * pert_outputs_var
+                                        - targets_oh_var * inf), 1)
+        
         # Compute $f(x')$, where $x'$ is the adversarial example in image space.
         # The result `f_var` should be of dimension [B]
         if self.targeted:
@@ -450,6 +495,14 @@ class L2Adversary(object):
             # noinspection PyArgumentList
             f_var = torch.clamp(maxother_activ_var - target_activ_var
                                 + self.confidence, min=0.0)
+            out_detector = torch.zeros(batch_size, 2).to(device)
+            for i in range(batch_size):
+                #print(targets_oh_var[i])
+                ind = torch.argmax(targets_oh_var[i])
+                #print(ind)
+                #print(type(inp_detector[i]))
+                #print(type(detectors[ind]))
+                out_detector[i] = detectors[ind](inp_detector[i])
         else:
             # if not targeted, optimize to make `maxother_activ_var` larger than
             # `target_activ_var` (the ground truth image labels) by
@@ -458,22 +511,40 @@ class L2Adversary(object):
             # noinspection PyArgumentList
             f_var = torch.clamp(target_activ_var - maxother_activ_var
                                 + self.confidence, min=0.0)
+            out_detector = torch.zeros(batch_size, 2)
+            for i in range(batch_size):
+                max_other_target = maxother_activ_ind[i]
+                #print(detectors[max_other_target](inp_detector[i]).size())
+                out_detector[i] = detectors[max_other_target](inp_detector[i].reshape(1, 784))
+          
+        #print(out_detector)
+        # high loss for detector if input belongs to true class
+        detector_loss = torch.zeros(batch_size).to(device)
+        for i in range(batch_size):
+            #detector_loss[i] = (out_detector[i][0][1] - out_detector[i][0][0])
+            detector_loss[i] = (out_detector[i][0] - out_detector[i][1])
+            
         # the total loss of current batch, should be of dimension [1]
-        batch_loss_var = torch.sum(perts_norm_var + c_var * f_var)  # type: Variable
+        batch_loss_var = torch.sum(perts_norm_var + c_var * (f_var + detector_loss))  # type: Variable
 
         # Do optimization for one step
         optimizer.zero_grad()
-        batch_loss_var.backward()
+        batch_loss_var.backward()#retain_graph = True)
+        # summing gradient for detector loss
+        #detector_loss.backward()
+        
         optimizer.step()
 
         # Make some records in python/numpy on CPU
-        batch_loss = batch_loss_var.data[0]  # type: float
+        batch_loss = batch_loss_var.item()#.data[0]  # type: float
         pert_norms_np = _var2numpy(perts_norm_var)
         pert_outputs_np = _var2numpy(pert_outputs_var)
-        advxs_np = _var2numpy(advxs_var)
-        return batch_loss, pert_norms_np, pert_outputs_np, advxs_np
+        advxs_np = advxs_var.detach()#_var2numpy(advxs_var)
+        #print(advxs_np.dtype)
+        #print(torch.Tensor(advxs_np).dtype)
+        return batch_loss, pert_norms_np, pert_outputs_np, advxs_np, out_detector
 
-    def _attack_successful(self, prediction, target):
+    def _attack_successful(self, prediction, target, out_detector=torch.Tensor([1,0])):
         """
         See whether the underlying attack is successful.
 
@@ -484,10 +555,13 @@ class L2Adversary(object):
         :return: ``True`` if the attack is successful
         :rtype: bool
         """
+        #print(out_detector)
         if self.targeted:
-            return prediction == target
+            #return prediction == target and (out_detector[0][0] >= out_detector[0][1]).numpy().astype(bool)
+            return prediction == target and (out_detector[0] >= out_detector[1])#.numpy().astype(bool)
         else:
-            return prediction != target
+            #return prediction != target and (out_detector[0][0] >= out_detector[0][1]).numpy().astype(bool)
+            return prediction != target and (out_detector[0] >= out_detector[1]).numpy().astype(bool)
 
     # noinspection PyUnresolvedReferences
     def _compensate_confidence(self, outputs, targets):
